@@ -27,7 +27,7 @@ func NewExtParser() (*parser.ExtParser, error) {
 		return nil, err
 	}
 
-	pdfParser := NewPDFParser(500, 200)
+	pdfParser := NewPDFParser()
 
 	// 创建扩展解析器
 	extParser, err := parser.NewExtParser(ctx, &parser.ExtParserConfig{

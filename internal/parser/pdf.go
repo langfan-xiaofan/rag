@@ -3,17 +3,13 @@ package parser
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math"
-	"os"
 	"runtime"
 	"strings"
 	"sync"
 
-	einopdf "github.com/cloudwego/eino-ext/components/document/parser/pdf"
 	"github.com/cloudwego/eino/components/document"
 	"github.com/cloudwego/eino/components/document/parser"
 	"github.com/cloudwego/eino/schema"
@@ -22,64 +18,66 @@ import (
 	"github.com/ledongthuc/pdf"
 )
 
+// PDFParser 实现 eino 的 parser.Parser 与 document.Loader 接口。
+// 主路径用 ledongthuc/pdf 按行距切分；文本层缺失（扫描件）时整份降级给 go-fitz。
 type PDFParser struct {
-	fileName  string
-	ChunkSize int
-	Overlap   int
+	fileName string
 }
 
-type Document struct {
-	ID       string
-	Content  string
-	MetaData map[string]any
+func NewPDFParser() *PDFParser {
+	return &PDFParser{}
 }
 
-func NewPDFParser(chunksize, overlap int) *PDFParser {
-	return &PDFParser{
-		ChunkSize: chunksize,
-		Overlap:   overlap,
-	}
-}
-
-// Parse 并发提取 PDF 每页文本。
-// go-fitz 的单个 Document 内部有互斥锁，无法并发；这里按 worker 数，默认是8个worker
-// 打开多个 Document 实例（各自独立的 MuPDF context），按页分片并行提取。
-func ParsePDFByFitz(reader io.Reader) ([]*schema.Document, error) {
-	// 先开一个实例获取页数，再决定实际需要的 worker 数
-	first, err := fitz.NewFromReader(reader)
+// ParsePDFByFitz 用 go-fitz（MuPDF）并发提取每页文本，作为扫描件的降级方案。
+//
+// go-fitz 的单个 Document 内部有互斥锁、无法并发，这里按 worker 数打开多个
+// Document 实例（各自独立的 MuPDF context），按页分片并行提取。
+//
+// 入参是整份文件的字节而不是 io.Reader：fitz.NewFromReader 内部就是 io.ReadAll，
+// 会把 reader 读到 EOF，而我们要从同一份数据里开多个实例。
+func ParsePDFByFitz(data []byte) ([]*schema.Document, error) {
+	first, err := fitz.NewFromMemory(data)
 	if err != nil {
-		return nil, errors.New("打开文件失败1" + err.Error())
+		return nil, fmt.Errorf("打开 PDF 失败: %w", err)
 	}
 	numPage := first.NumPage()
+	source := first.Metadata()["title"]
 
-	workers := runtime.NumCPU()
-	if workers > 8 {
-		workers = 8 // 每个实例有独立 MuPDF store，过多会成倍占内存
-	}
-	if workers > numPage {
-		workers = numPage
-	}
+	workers := min(runtime.NumCPU(), 8, numPage) // 每个实例有独立 MuPDF store，过多会成倍占内存
 	if workers < 1 {
 		workers = 1
 	}
 
 	docs := make([]*fitz.Document, workers)
 	docs[0] = first
-	for i := 1; i < workers; i++ {
-		d, err := fitz.NewFromReader(reader)
-		if err != nil {
-			for _, opened := range docs[:i] {
-				opened.Close()
+	defer func() {
+		for _, d := range docs {
+			if d != nil {
+				d.Close()
 			}
-			return nil, errors.New("打开文件失败2")
+		}
+	}()
+	for i := 1; i < workers; i++ {
+		d, err := fitz.NewFromMemory(data)
+		if err != nil {
+			return nil, fmt.Errorf("打开 PDF 失败（第 %d 个实例）: %w", i, err)
 		}
 		docs[i] = d
 	}
-	for _, d := range docs {
-		defer d.Close()
+
+	// 先把每个下标都初始化好。worker 按下标各写各的，留空指针会在赋值时 panic，
+	// 而 panic 发生在子 goroutine 里，调用方的 recover 接不住，会直接终止进程。
+	pages := make([]*schema.Document, numPage)
+	for i := range pages {
+		pages[i] = &schema.Document{
+			ID: uuid.New().String(),
+			MetaData: map[string]any{
+				"page":   i,
+				"source": source,
+			},
+		}
 	}
 
-	pages := make([]*schema.Document, numPage)
 	var mu sync.Mutex
 	var firstErr error
 
@@ -94,16 +92,13 @@ func ParsePDFByFitz(reader io.Reader) ([]*schema.Document, error) {
 				if err != nil {
 					mu.Lock()
 					if firstErr == nil {
-						firstErr = fmt.Errorf("读取第%d页失败: %v", i, err)
+						firstErr = fmt.Errorf("读取第%d页失败: %w", i, err)
 					}
 					mu.Unlock()
 					continue
 				}
-				pages[i].Content = text // 各写各的下标，无需加锁
-				pages[i].ID = uuid.New().String()
-				pages[i].MetaData["page"] = i
-				pages[i].MetaData["content"] = text
-				pages[i].MetaData["source"] = first.Metadata()["title"]
+				pages[i].Content = strings.ReplaceAll(text, "\n", "")
+				pages[i].MetaData["content"] = pages[i].Content
 			}
 		}(docs[w])
 	}
@@ -116,147 +111,83 @@ func ParsePDFByFitz(reader io.Reader) ([]*schema.Document, error) {
 	if firstErr != nil {
 		return nil, firstErr
 	}
-	for k := range pages {
-		pages[k].Content = strings.ReplaceAll(pages[k].Content, "\n", "")
-	}
 	return pages, nil
 }
 
-// Parse 将PDF的每一行的文字按照切片返回
+// Parse 用 ledongthuc/pdf 提取每页文本，按行距与句末标点切成段落。
 func (p *PDFParser) Parse(ctx context.Context, reader io.Reader, opts ...parser.Option) ([]*schema.Document, error) {
 	// apply 是未导出字段，实现自定义选项必须通过 parser.GetImplSpecificOptions 应用
 	parser.GetImplSpecificOptions(p, opts...)
 	data, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, fmt.Errorf("pdf parser read all from reader failed: %w", err)
+		return nil, fmt.Errorf("读取 PDF 失败: %w", err)
 	}
 
-	readerAt := bytes.NewReader(data)
-	r, err := pdf.NewReader(readerAt, int64(readerAt.Len()))
+	r, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("解析 PDF 失败: %w", err)
 	}
+
 	var texts []*schema.Document
-	lastY := 0.0
-	fmt.Println(r.NumPage())
-	for i := 1; i <= r.NumPage(); i++ {
+	numPage := r.NumPage()
+	for i := 1; i <= numPage; i++ {
+		items := r.Page(i).Content().Text
+
+		// 这一页没有任何文本元素、且此前一无所获：整份文档大概率是扫描件。
+		// 直接返回 fitz 的结果，不再混用两种提取方式——ParsePDFByFitz 返回的是
+		// 整份文档，继续往下走会把后面的页重复提取一遍。
+		if len(items) == 0 && len(texts) == 0 {
+			return ParsePDFByFitz(data)
+		}
+
 		var buff strings.Builder
-		for _, t := range r.Page(i).Content().Text {
-			if math.Abs(t.Y-lastY) > 0.5*t.FontSize && strings.HasSuffix(buff.String(), "。") { // 假设行间距大于1.0时认为是新行
-				texts = append(texts, &schema.Document{
-					Content: buff.String(),
-					ID:      uuid.NewString(),
-					MetaData: map[string]any{
-						"content": buff.String(),
-						"page":    i,
-						"source":  p.fileName,
-					},
-				})
+		lastY := 0.0 // 每页独立，跨页比较 Y 没有意义
+		for _, t := range items {
+			if math.Abs(t.Y-lastY) > 0.5*t.FontSize && strings.HasSuffix(buff.String(), "。") {
+				texts = append(texts, p.newDocument(buff.String(), i))
 				buff.Reset()
 			}
 			lastY = t.Y
-			//去掉页脚的信息
+			// 去掉页脚的信息
 			if t.Y > 20 {
-				buff.Write([]byte(t.S))
+				buff.WriteString(t.S)
 			}
-			// time.Sleep(time.Millisecond * 10) // 避免输出过快，导致终端卡顿
 		}
 		if buff.Len() != 0 {
-			texts = append(texts, &schema.Document{
-				Content: buff.String(),
-				ID:      uuid.NewString(),
-				MetaData: map[string]any{
-					"content": buff.String(),
-					"page":    i,
-					"source":  p.fileName,
-				},
-			})
-		}
-		// fmt.Printf("texts:%v", texts)
-		//如果该页面没有任何的文本，就降级使用fitz来分析
-		if len(r.Page(i).Content().Text) == 0 && len(texts) == 0 {
-			Newtexts, err := ParsePDFByFitz(bytes.NewReader(data))
-			if err != nil {
-				log.Fatal(err)
-				return nil, err
-			}
-			fmt.Println(Newtexts)
-			texts = append(texts, Newtexts...)
+			texts = append(texts, p.newDocument(buff.String(), i))
 		}
 	}
 	return texts, nil
 }
 
+// newDocument 构造一个分块。content 同时写进 Content 和 MetaData["content"]：
+// 前者用于向量化，后者会被 indexer 写进 payload、供检索时还原成文档正文。
+func (p *PDFParser) newDocument(content string, page int) *schema.Document {
+	return &schema.Document{
+		Content: content,
+		ID:      uuid.NewString(),
+		MetaData: map[string]any{
+			"content": content,
+			"page":    page,
+			"source":  p.fileName,
+		},
+	}
+}
+
 func WithFileName(filename string) parser.Option {
 	return parser.WrapImplSpecificOptFn(func(o *PDFParser) {
-
 		o.fileName = filename
 	})
 }
 
-// Load 该方法是用于嵌入Eino框架的实现，用于返回schema的Document切片
-
+// Load 实现 eino 的 document.Loader，从本地路径读取 PDF。
 func (p *PDFParser) Load(ctx context.Context, src document.Source, opts ...document.LoaderOption) ([]*schema.Document, error) {
 	f, _, err := pdf.Open(src.URI)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	// var docs []*schema.Document
-	// var buf strings.Builder
 	return p.Parse(ctx, f, WithFileName(f.Name()))
-	// for _, text := range texts {
-	// 	doc := &schema.Document{
-	// 		ID:      text.ID,
-	// 		Content: text.Content,
-	// 		MetaData: map[string]any{
-	// 			"filename": f.Name(),
-	// 		},
-	// 	}
-	// 	docs = append(docs, doc)
-	// }
-	// for i := range r.NumPage() {
-	// 	for _, t := range r.Page(i).Content().Text {
-	// 		if t.Y >= 20 {
-	// 			buf.WriteString(t.S)
-	// 		}
-	// 	}
-	// 	doc := &schema.Document{
-	// 		Content: buf.String(),
-	// 		MetaData: map[string]interface{}{
-	// 			"page": i + 1,
-	// 		},
-	// 	}
-	// 	buf.Reset()
-	// 	docs = append(docs, doc)
-	// }
-	// return docs, nil
-}
-
-func ParsePDFByEino(filePath string) ([]*schema.Document, error) {
-	ctx := context.Background()
-
-	parser, err := einopdf.NewPDFParser(ctx, &einopdf.Config{
-		ToPages: true,
-	})
-	if err != nil {
-		log.Fatalf("pdf.NewPDFParser failed, err=%v", err)
-	}
-
-	file, err := os.Open(filePath)
-	if err != nil {
-		log.Fatalf("os.Open failed, err=%v", err)
-	}
-	defer file.Close()
-
-	docs, err := parser.Parse(ctx, file)
-	if err != nil {
-		log.Fatalf("parser.Parse failed, err=%v", err)
-	}
-
-	// log.Printf("解析了 %d 个文档", len(docs))
-	log.Printf("内容: %s", docs[0].Content)
-	return docs, nil
 }
 
 var _ document.Loader = (*PDFParser)(nil)
