@@ -1,0 +1,14 @@
+# 密钥与本地配置
+.env
+config/config.local.yaml
+
+# IDE
+.idea/
+internal/.idea/
+
+# 临时脚本与产物
+tmp_*/
+*.log
+
+# AI 会话导出（226KB，含项目上下文）
+kimi-export-session_*.md
