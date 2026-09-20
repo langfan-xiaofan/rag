@@ -24,7 +24,7 @@ func Init() (*gorm.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("连接 MySQL 失败，请确认数据库已启动且 config.yaml 的 database 配置正确: %w", err)
 	}
-	if err := db.AutoMigrate(&model.User{}); err != nil {
+	if err := db.AutoMigrate(&model.User{}, &model.Session{}, &model.Message{}, &model.Summary{}); err != nil {
 		return nil, fmt.Errorf("自动迁移表结构失败: %w", err)
 	}
 	return db, nil

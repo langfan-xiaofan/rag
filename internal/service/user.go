@@ -34,19 +34,19 @@ func (svc *UserService) Register(ctx context.Context, req dto.RegisterReq) error
 	})
 }
 
-func (svc *UserService) Login(ctx context.Context, req dto.LoginReq) error {
+func (svc *UserService) Login(ctx context.Context, req dto.LoginReq) (uint, error) {
 	var user *model.User
 	user, err := svc.dao.GetUserByUsername(ctx, req.Username)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	hashpassworrd, err := password.HashPassword(req.Password)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	fmt.Printf("%s\n%s\n", hashpassworrd, user.Password)
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)); err != nil {
-		return errors.New("账号或密码错误")
+		return 0, errors.New("账号或密码错误")
 	}
-	return nil
+	return user.ID, nil
 }

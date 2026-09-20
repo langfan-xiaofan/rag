@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	agent2 "rag/internal/agent"
 	"rag/internal/dto"
+	"rag/internal/memory"
+	"rag/internal/model"
 	"rag/internal/retriever"
 	"rag/internal/silo"
 
@@ -13,27 +16,40 @@ import (
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/embedding"
 	"github.com/cloudwego/eino/schema"
+	"github.com/google/uuid"
 	"github.com/qdrant/go-client/qdrant"
 )
 
 type AgentService struct {
-	qdrant    *qdrant.Client
-	embedder  embedding.Embedder
-	chatmodel *openai.ChatModel
-	silo      *silo.Silo
+	qdrant         *qdrant.Client
+	embedder       embedding.Embedder
+	chatmodel      *openai.ChatModel
+	silo           *silo.Silo
+	sessionManager *memory.SessionManager
 }
 
-func NewAgentService(qdrant *qdrant.Client, embedder embedding.Embedder, chatmodel *openai.ChatModel, siloClient *silo.Silo) *AgentService {
+func NewAgentService(qdrant *qdrant.Client, embedder embedding.Embedder, chatmodel *openai.ChatModel, siloClient *silo.Silo, sessionManager *memory.SessionManager) *AgentService {
 	return &AgentService{
-		qdrant:    qdrant,
-		embedder:  embedder,
-		chatmodel: chatmodel,
-		silo:      siloClient,
+		qdrant:         qdrant,
+		embedder:       embedder,
+		chatmodel:      chatmodel,
+		silo:           siloClient,
+		sessionManager: sessionManager,
 	}
 }
 
-func (svc *AgentService) Ask(query string, username string, TopK int) (<-chan dto.StreamChunk, error) {
-	ctx := context.Background()
+func (svc *AgentService) Ask(ctx context.Context, query string, username string, TopK int, userID uint, sessionID string, limit int) (string, <-chan dto.StreamChunk, error) {
+	if sessionID == "" {
+		sessionID = uuid.New().String()
+	}
+	// 会话不存在就按新对话建，已删除则直接报错（handler 会返回 400）
+	if err := svc.sessionManager.EnsureSession(ctx, userID, sessionID, query); err != nil {
+		return "", nil, err
+	}
+	history, err := svc.sessionManager.GetMessages(ctx, userID, sessionID, limit)
+	if err != nil {
+		return "", nil, err
+	}
 	ragRetriever := retriever.NewQdrantRetriever(retriever.Config{
 		Client:     svc.qdrant,
 		Collection: username,
@@ -46,7 +62,12 @@ func (svc *AgentService) Ask(query string, username string, TopK int) (<-chan dt
 		TopK:       TopK,
 		Embedder:   svc.embedder,
 	})
-	agent := agent2.NewAgent(ragRetriever, fileRetriever, svc.silo, username)
+	agent := agent2.NewAgent(ragRetriever, fileRetriever, svc.silo, username, func(ctx context.Context, message *schema.Message) {
+		// 客户端可能已经断开、ctx 已被取消，但这条消息仍然要落库
+		if err := svc.sessionManager.AppendMessage(context.WithoutCancel(ctx), userID, sessionID, model.Message{Msg: message}); err != nil {
+			log.Printf("保存消息失败: %v", err)
+		}
+	})
 	runner := adk.NewRunner(context.Background(), adk.RunnerConfig{
 		Agent:           agent,
 		EnableStreaming: true,
@@ -77,20 +98,37 @@ func (svc *AgentService) Ask(query string, username string, TopK int) (<-chan dt
 	//context := buff.String()
 	//prompt := fmt.Sprintf(prompttemp, context)
 	var messages []*schema.Message
-	messages = append(messages, schema.SystemMessage(prompt), schema.UserMessage(query))
+	messages = append(messages, schema.SystemMessage(prompt))
+	messages = append(messages, history...)
+	messages = append(messages, schema.UserMessage(query))
+	err = svc.sessionManager.AppendMessage(ctx, userID, sessionID, model.Message{
+		UserID:    userID,
+		SessionID: sessionID,
+		Msg:       schema.UserMessage(query),
+	})
+	if err != nil {
+		return "", nil, err
+	}
 	result := runner.Run(ctx, messages)
 	output := make(chan dto.StreamChunk, 10)
 	go func() {
 		defer close(output)
+		// 客户端断开后 handler 不再读 channel，这里必须能主动退出，否则 goroutine 会永久阻塞
+		send := func(chunk dto.StreamChunk) bool {
+			select {
+			case output <- chunk:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
 		for {
 			event, ok := result.Next()
 			if !ok {
 				break
 			}
 			if event.Err != nil {
-				output <- dto.StreamChunk{
-					Err: event.Err,
-				}
+				send(dto.StreamChunk{Err: event.Err})
 				return
 			}
 			if event.Output == nil || event.Output.MessageOutput == nil {
@@ -98,7 +136,7 @@ func (svc *AgentService) Ask(query string, username string, TopK int) (<-chan dt
 			}
 			mo := event.Output.MessageOutput
 			if mo.Role == schema.Tool {
-				continue
+				continue // 工具消息不推给前端，但已在中间件里落库
 			}
 			if mo.IsStreaming && mo.MessageStream != nil {
 				for {
@@ -107,44 +145,21 @@ func (svc *AgentService) Ask(query string, username string, TopK int) (<-chan dt
 						break
 					}
 					if err != nil {
-						output <- dto.StreamChunk{
-							Err: err,
-						}
+						send(dto.StreamChunk{Err: err})
 						return
 					}
-					if msg.Content != "" {
-						output <- dto.StreamChunk{
-							Content: msg.Content,
-							Err:     nil,
-						}
+					if msg.Content != "" && !send(dto.StreamChunk{Content: msg.Content}) {
+						return
 					}
 				}
+				continue
 			}
 			if m := mo.Message; m != nil && m.Content != "" {
-				output <- dto.StreamChunk{Content: m.Content}
+				if !send(dto.StreamChunk{Content: m.Content}) {
+					return
+				}
 			}
 		}
 	}()
-	//go func() {
-	//	defer close(output)
-	//	defer result.Close()
-	//	for {
-	//		rev, err := result.Recv()
-	//		if err != nil {
-	//			if err == io.EOF {
-	//				break
-	//			}
-	//			return
-	//		}
-	//		if rev.Content == "" {
-	//			continue
-	//		}
-	//		select {
-	//		case output <- rev.Content:
-	//		case <-ctx.Done():
-	//			return
-	//		}
-	//	}
-	//}()
-	return output, nil
+	return sessionID, output, nil
 }

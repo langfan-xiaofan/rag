@@ -9,13 +9,15 @@ import (
 )
 
 type MyClaims struct {
-	Username string `json:"id"`
+	Username string `json:"username"`
+	UserID   uint   `json:"user_id"`
 	jwt.RegisteredClaims
 }
 
-func GenerateToken(username string) (string, error) {
+func GenerateToken(username string, userID uint) (string, error) {
 	claims := MyClaims{
 		username,
+		userID,
 		jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour * time.Duration(config.Conf.Jwt.Hour))),
 			Issuer:    "rag",

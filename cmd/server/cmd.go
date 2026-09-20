@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"rag/internal/memory"
 
 	"rag/internal/config"
 	"rag/internal/database"
@@ -93,8 +94,9 @@ func Cmd() {
 		TextEmbedder:  Textembedder,
 		MultiEmbedder: multiModalembedder,
 	})
-
-	router.InitRouter(r, db, qdrantclient, siloClient, pipeline, Textembedder, chatmodel)
+	// 记忆管理模块
+	sessionManager := memory.NewSessionManager(db, 20)
+	router.InitRouter(r, db, qdrantclient, siloClient, pipeline, sessionManager, Textembedder, chatmodel)
 	srv := http.Server{
 		Addr:    ":8080",
 		Handler: r,

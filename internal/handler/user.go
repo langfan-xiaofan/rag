@@ -50,7 +50,7 @@ func (h *UserHandler) Login(c *gin.Context) {
 		})
 		return
 	}
-	err := h.svc.Login(c, req)
+	userid, err := h.svc.Login(c, req)
 	if err != nil {
 		c.JSON(500, map[string]any{
 			"msg":  err.Error(),
@@ -58,7 +58,7 @@ func (h *UserHandler) Login(c *gin.Context) {
 		})
 		return
 	}
-	token, err := jwt.GenerateToken(req.Username)
+	token, err := jwt.GenerateToken(req.Username, userid)
 	c.JSON(200, map[string]any{
 		"msg": "登录成功",
 		"data": map[string]any{

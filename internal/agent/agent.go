@@ -17,10 +17,13 @@ import (
 
 type Handler struct {
 	*adk.BaseChatModelAgentMiddleware
+	onMessage func(ctx context.Context, message *schema.Message) //存储上下文的闭包函数，里面鞋带了UserID，sessionID等信息。
 }
 
-func NewHandler() *Handler {
-	return &Handler{}
+func NewHandler(onMessage func(ctx context.Context, message *schema.Message)) *Handler {
+	return &Handler{
+		onMessage: onMessage,
+	}
 }
 
 func (h *Handler) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
@@ -28,7 +31,21 @@ func (h *Handler) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentCon
 	return ctx, runCtx, nil
 }
 
-func NewAgent(ragRetriever, fileRetriever retriever.Retriever, silo *silo.Silo, bucket string) adk.ResumableAgent {
+func (h *Handler) AfterModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, mc *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
+	if len(state.Messages) == 0 {
+		return ctx, state, nil
+	}
+	// 只落库本轮模型新产出的那一条：Content 为空但带 ToolCalls 的也要存，
+	// 它是后面那条 tool 消息的另一半
+	last := state.Messages[len(state.Messages)-1]
+	if last == nil || (last.Content == "" && len(last.ToolCalls) == 0) {
+		return ctx, state, nil
+	}
+	h.onMessage(ctx, last)
+	return ctx, state, nil
+}
+
+func NewAgent(ragRetriever, fileRetriever retriever.Retriever, silo *silo.Silo, bucket string, onMessage func(ctx context.Context, message *schema.Message)) adk.ResumableAgent {
 	chatmodel, err := openai.NewChatModel(context.Background(), &openai.ChatModelConfig{
 		BaseURL: os.Getenv("DEEPSEEK_BASE_URL"),
 		APIKey:  os.Getenv("DEEPSEEK_API_KEY"),
@@ -57,6 +74,7 @@ func NewAgent(ragRetriever, fileRetriever retriever.Retriever, silo *silo.Silo, 
 								if err != nil {
 									return nil, err
 								}
+								onMessage(ctx, schema.ToolMessage(output.Result, input.CallID, schema.WithToolName(input.Name))) //利用闭包函数存储工具类型的消息。
 								log.Printf("调用工具 %s: %v\n", input.Name, input.Arguments)
 								log.Printf("工具结果: %v\n", output.Result)
 								return output, nil
@@ -67,7 +85,7 @@ func NewAgent(ragRetriever, fileRetriever retriever.Retriever, silo *silo.Silo, 
 			},
 		},
 		Handlers: []adk.TypedChatModelAgentMiddleware[*schema.Message]{
-			NewHandler(),
+			NewHandler(onMessage),
 		},
 		MaxIterations: 10000,
 	})
