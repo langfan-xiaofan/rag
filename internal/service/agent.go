@@ -67,7 +67,7 @@ func (svc *AgentService) Ask(ctx context.Context, query string, username string,
 		if err := svc.sessionManager.AppendMessage(context.WithoutCancel(ctx), userID, sessionID, model.Message{Msg: message}); err != nil {
 			log.Printf("保存消息失败: %v", err)
 		}
-	})
+	}, username, svc.qdrant)
 	runner := adk.NewRunner(context.Background(), adk.RunnerConfig{
 		Agent:           agent,
 		EnableStreaming: true,

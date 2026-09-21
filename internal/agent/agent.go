@@ -13,6 +13,7 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
+	"github.com/qdrant/go-client/qdrant"
 )
 
 type Handler struct {
@@ -45,7 +46,8 @@ func (h *Handler) AfterModelRewriteState(ctx context.Context, state *adk.ChatMod
 	return ctx, state, nil
 }
 
-func NewAgent(ragRetriever, fileRetriever retriever.Retriever, silo *silo.Silo, bucket string, onMessage func(ctx context.Context, message *schema.Message)) adk.ResumableAgent {
+func NewAgent(ragRetriever, fileRetriever retriever.Retriever, silo *silo.Silo, bucket string,
+	onMessage func(ctx context.Context, message *schema.Message), username string, qdrantClient *qdrant.Client) adk.ResumableAgent {
 	chatmodel, err := openai.NewChatModel(context.Background(), &openai.ChatModelConfig{
 		BaseURL: os.Getenv("DEEPSEEK_BASE_URL"),
 		APIKey:  os.Getenv("DEEPSEEK_API_KEY"),
@@ -63,8 +65,10 @@ func NewAgent(ragRetriever, fileRetriever retriever.Retriever, silo *silo.Silo, 
 			ToolsNodeConfig: compose.ToolsNodeConfig{
 				Tools: []tool.BaseTool{
 					tools.NewRagTool(ragRetriever),
-					tools.GetFilesTool(silo, bucket),
-					tools.NewGetFilesNameTool(fileRetriever),
+					tools.GetFileObjectTool(silo, bucket, username, qdrantClient),
+					//tools.NewGetFilesNameTool(fileRetriever),
+					tools.NewListFileTool(context.Background(), username, qdrantClient),
+					tools.RagSearchByFileName(ragRetriever),
 				},
 				ToolCallMiddlewares: []compose.ToolMiddleware{
 					{

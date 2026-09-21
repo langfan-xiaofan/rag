@@ -1,14 +1,45 @@
-# 密钥与本地配置
+# ---- 密钥与本地配置 ----
 .env
+.env.*
+!.env.example
 config/config.local.yaml
+*.local.yaml
+*.jks
+*.keystore
+*.p12
 
-# IDE
+# ---- Docker（只作本地部署用；clone 后无法 docker compose up --build）----
+/Dockerfile
+/.dockerignore
+/docker-compose.yaml
+/docker-compose.app.yaml
+docker-compose.override.yml
+
+# ---- 整个目录不入库 ----
+/desktop/
+/docs/
+
+# ---- Go 构建产物 ----
+/rag
+/rag.exe
+*.test
+coverage.out
+*.prof
+__debug_bin*
+go.work.sum
+
+# ---- IDE / 临时文件 / 系统 ----
 .idea/
-internal/.idea/
-
-# 临时脚本与产物
-tmp_*/
+.vscode/
+*.iml
+*.swp
+*.swo
+tmp*/
 *.log
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
 
-# AI 会话导出（226KB，含项目上下文）
+# ---- AI 会话导出 ----
 kimi-export-session_*.md

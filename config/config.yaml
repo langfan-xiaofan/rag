@@ -2,7 +2,7 @@ jwt:
   key: ""
   hour: 24
 embedder:
-  base_url: "http://localhost:8081/v1"
+  base_url: "https://api.siliconflow.cn/v1"
   model: "BAAI/bge-m3"
   api_key: ""
 mysql:

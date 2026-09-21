@@ -2,7 +2,8 @@ package bm25
 
 import (
 	"math"
-	"rag/utils/jieba"
+
+	"rag/utils/segment"
 
 	"github.com/cloudwego/eino/schema"
 )
@@ -11,11 +12,11 @@ func BM25(docs []*schema.Document, query string) []*schema.Document {
 	k1 := 1.2
 	b := 0.75
 	length := 0.0
-	queryWords := UniqueQueryWords(jieba.JieBa(query))
+	queryWords := UniqueQueryWords(segment.Cut(query))
 	invertedIndex := map[string]map[string]float64{}
 	docLengths := make(map[string]float64)
 	for _, doc := range docs {
-		words := jieba.JieBa(doc.Content)
+		words := segment.Cut(doc.Content)
 		length += float64(len(words))
 		docLengths[doc.ID] = float64(len(words))
 		for _, word := range words {

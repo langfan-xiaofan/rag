@@ -9,7 +9,6 @@ require (
 	github.com/cloudwego/eino v0.9.19
 	github.com/cloudwego/eino-ext/components/document/parser/docx v0.0.0-20260909094858-6fe16d48b736
 	github.com/cloudwego/eino-ext/components/document/parser/html v0.0.0-20260909094858-6fe16d48b736
-	github.com/cloudwego/eino-ext/components/document/parser/pdf v0.0.0-20260909094858-6fe16d48b736
 	github.com/cloudwego/eino-ext/components/document/transformer/splitter/html v0.0.0-20260909094858-6fe16d48b736
 	github.com/cloudwego/eino-ext/components/document/transformer/splitter/markdown v0.0.0-20260909094858-6fe16d48b736
 	github.com/cloudwego/eino-ext/components/document/transformer/splitter/recursive v0.0.0-20260909094858-6fe16d48b736
@@ -18,6 +17,7 @@ require (
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.13
 	github.com/gen2brain/go-fitz v1.28.2
 	github.com/gin-gonic/gin v1.12.0
+	github.com/go-ego/gse v1.1.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/ledongthuc/pdf v0.0.0-20260907135840-6c8c28e0e8a0
@@ -25,8 +25,8 @@ require (
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/spf13/viper v1.21.0
 	github.com/subosito/gotenv v1.6.0
-	github.com/yanyiwu/gojieba v1.4.7
 	golang.org/x/crypto v0.55.0
+	google.golang.org/grpc v1.83.2
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/gorm v1.31.2
 )
@@ -99,6 +99,7 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.1 // indirect
+	github.com/vcaesar/cedar v0.50.0 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	github.com/yargevad/filepathx v1.0.0 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
@@ -110,7 +111,6 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
-	google.golang.org/grpc v1.83.2 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

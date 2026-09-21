@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"strings"
 
 	"rag/internal/ingest"
 	"rag/internal/service"
@@ -33,11 +34,10 @@ func (h *FileHandler) UpLoadFile(c *gin.Context) {
 		response.Fail(c, http.StatusBadRequest, nil, "缺少文件字段 files")
 		return
 	}
-	filePrefixes := form.Value["filePrefix"]
-	if len(filePrefixes) == 0 || filePrefixes[0] == "" {
-		response.Fail(c, http.StatusBadRequest, nil, "缺少字段 filePrefix")
-		return
-	}
+	// filePrefix 可选：给了就存成 prefix/filename，不给就直接放在桶根目录。
+	// 真实 key 会随文件记录一起落库，get_files 签发下载链接时按记录里的 key 走，
+	// 所以填不填前缀都能下载到（早期没有 key 的记录再按文件名在桶里兜底找）。
+	prefix := strings.TrimSpace(c.PostForm("filePrefix"))
 	// collectionName 只做校验，不参与逻辑：集合名固定取 username，
 	// 让客户端指定集合名会造成跨用户数据串写。
 	if len(form.Value["collectionName"]) == 0 {
@@ -45,7 +45,7 @@ func (h *FileHandler) UpLoadFile(c *gin.Context) {
 		return
 	}
 
-	failed := h.svc.Upload(c.Request.Context(), files, c.GetString("username"), filePrefixes[0])
+	failed := h.svc.Upload(c.Request.Context(), files, c.GetString("username"), prefix)
 	if len(failed) > 0 {
 		response.Fail(c, 500, failed, "文件上传失败")
 		return

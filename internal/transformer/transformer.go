@@ -24,14 +24,24 @@ type Transformer struct {
 
 func NewTransformer(chunkSize int, overLap int, embedder embedding.Embedder) *Transformer {
 	ctx := context.Background()
-	md, _ := markdown.NewHeaderSplitter(ctx, &markdown.HeaderConfig{})
-	htmlSplitter, _ := html.NewHeaderSplitter(ctx, &html.HeaderConfig{})
 	re, _ := recursive.NewSplitter(ctx, &recursive.Config{
 		ChunkSize:   chunkSize,
 		OverlapSize: overLap,
 		LenFunc:     Len,
 		Separators:  []string{"\n\n", "\n", "？", "！", "。", "；", "，"},
 	})
+	md, err := markdown.NewHeaderSplitter(ctx, &markdown.HeaderConfig{
+		Headers: map[string]string{
+			"#":    "h1",
+			"##":   "h2",
+			"###":  "h3",
+			"####": "h4",
+		},
+	})
+	if err != nil {
+		md = re
+	}
+	htmlSplitter, _ := html.NewHeaderSplitter(ctx, &html.HeaderConfig{})
 	pdf := NewPDFTransformer(chunkSize, overLap)
 	sema, _ := semantic.NewSplitter(ctx, &semantic.Config{
 		Embedding:    embedder,

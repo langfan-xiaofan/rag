@@ -17,6 +17,7 @@ import (
 	"rag/internal/silo"
 	"rag/internal/transformer"
 
+	"github.com/cloudwego/eino-ext/components/model/openai"
 	einoparser "github.com/cloudwego/eino/components/document/parser"
 	"github.com/cloudwego/eino/components/embedding"
 	"github.com/cloudwego/eino/schema"
@@ -35,6 +36,7 @@ type Config struct {
 	Silo          *silo.Silo
 	TextEmbedder  embedding.Embedder
 	MultiEmbedder embedding.Embedder
+	ChatModel     *openai.ChatModel
 }
 
 type Pipeline struct {
@@ -68,20 +70,30 @@ func (p *Pipeline) IngestFile(ctx context.Context, f *multipart.FileHeader, t Ta
 	if err != nil {
 		return fmt.Errorf("文件类型解析失败: %w", err)
 	}
+	recordType := strings.ToLower(strings.TrimPrefix(filepath.Ext(f.Filename), "."))
+	if recordType == "" {
+		recordType = filetype
+	}
 
 	if err := p.cfg.Silo.UploadFile([]*multipart.FileHeader{f}, t.Username, t.Prefix); err != nil {
 		return fmt.Errorf("上传对象存储失败: %w", err)
-	}
-
-	if err := p.storeFileRecord(ctx, f, t); err != nil {
-		return fmt.Errorf("写入文件记录失败: %w", err)
 	}
 
 	var docs []*schema.Document
 	if strings.HasPrefix(filetype, "image/") {
 		docs, err = p.imageDocs(ctx, f.Filename, src)
 	} else {
+		var builder strings.Builder
 		docs, err = p.textDocs(ctx, f, src)
+		if err != nil {
+			return err
+		}
+		for _, doc := range docs {
+			builder.WriteString(doc.Content)
+		}
+		if err := p.storeFileRecord(ctx, f, t, builder.String(), recordType); err != nil {
+			return fmt.Errorf("写入文件记录失败: %w", err)
+		}
 	}
 	if err != nil {
 		return err
@@ -94,12 +106,20 @@ func (p *Pipeline) IngestFile(ctx context.Context, f *multipart.FileHeader, t Ta
 }
 
 // storeFileRecord 把文件的元信息单独写一条记录，供 list_file 之类的工具按文件名找文件。
-func (p *Pipeline) storeFileRecord(ctx context.Context, f *multipart.FileHeader, t Target) error {
-	var filetype string
-	if v := f.Header["filetype"]; len(v) > 0 {
-		filetype = v[0]
+func (p *Pipeline) storeFileRecord(ctx context.Context, f *multipart.FileHeader, t Target, content string, filetype string) error {
+	var result *schema.Message
+	var err error
+	var summary string
+	if content != "" {
+		parserPrompt := `你是一个生成文件内容摘要的专家，请你根据用户上传文件的内容，生成一份具有内容细节的摘要。`
+		messages := []*schema.Message{schema.SystemMessage(parserPrompt), schema.UserMessage(content)}
+		result, err = p.cfg.ChatModel.Generate(ctx, messages)
+		if err != nil {
+			return err
+		}
+		summary = result.Content
 	}
-	vector, err := p.cfg.TextEmbedder.EmbedStrings(ctx, []string{f.Filename})
+	vector, err := p.cfg.TextEmbedder.EmbedStrings(ctx, []string{fmt.Sprintf("文件名%s,摘要:%s", f.Filename, result)})
 	if err != nil {
 		return err
 	}
@@ -107,9 +127,11 @@ func (p *Pipeline) storeFileRecord(ctx context.Context, f *multipart.FileHeader,
 		ID: uuid.New().String(),
 		MetaData: map[string]any{
 			"filename": f.Filename,
+			"key":      silo.ObjectKey(t.Prefix, f.Filename),
 			"filetype": filetype,
 			"bucket":   t.Username,
 			"vector":   toFloat32(vector[0]),
+			"summary":  summary,
 		},
 	}
 	_, err = p.cfg.Indexer.Store(ctx, []*schema.Document{doc},
@@ -140,8 +162,14 @@ func (p *Pipeline) imageDocs(ctx context.Context, filename string, src io.Reader
 
 // textDocs 解析并按扩展名切分，再逐块做文本嵌入。
 // 每个分块都会带上 filename，供回答时标注来源。
-func (p *Pipeline) textDocs(ctx context.Context, f *multipart.FileHeader, src multipart.File) ([]*schema.Document, error) {
-	docs, err := p.cfg.Parser.Parse(ctx, src,
+func (p *Pipeline) textDocs(ctx context.Context, f *multipart.FileHeader, src multipart.File) (docs []*schema.Document, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			docs = nil
+			err = fmt.Errorf("解析文档时发生异常：%v", r)
+		}
+	}()
+	docs, err = p.cfg.Parser.Parse(ctx, src,
 		parser.WithFileName(f.Filename),
 		einoparser.WithURI(f.Filename),
 	)
@@ -163,6 +191,12 @@ func (p *Pipeline) textDocs(ctx context.Context, f *multipart.FileHeader, src mu
 		}
 		if docs[i].MetaData == nil {
 			docs[i].MetaData = make(map[string]any, 2)
+		}
+		if docs[i].ID == "" {
+			docs[i].ID = uuid.New().String()
+		}
+		if _, ok := docs[i].MetaData["content"]; !ok && doc.Content != "" {
+			docs[i].MetaData["content"] = doc.Content
 		}
 		docs[i].MetaData["filename"] = f.Filename
 		docs[i].MetaData["vector"] = toFloat32(vector[0])

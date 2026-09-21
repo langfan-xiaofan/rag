@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	retriever2 "rag/internal/retriever"
 	"strconv"
 
 	"github.com/cloudwego/eino/components/retriever"
@@ -53,4 +54,46 @@ func NewRagTool(re retriever.Retriever) tool.InvokableTool {
 			}
 			return output, nil
 		})
+}
+
+type RagSearchByFileNameInput struct {
+	FileName string `json:"file_name"`
+	Query    string `json:"query"`
+}
+
+type RagSearchByFileNameOutput struct {
+	Content  []string                 `json:"content"`
+	MetaData []map[string]interface{} `json:"meta_data"`
+}
+
+func RagSearchByFileName(re retriever.Retriever) tool.InvokableTool {
+	return utils.NewTool(&schema.ToolInfo{
+		Name: "ragbyFileName",
+		Desc: "当用户针对某一个文件进行提问的时候，使用此工具针对性的搜索该文件里面的知识",
+		ParamsOneOf: schema.NewParamsOneOfByParams(
+			map[string]*schema.ParameterInfo{
+				"file_name": {
+					Type:     "string",
+					Required: true,
+					Desc:     "文件的名称",
+				},
+				"query": {
+					Type:     "string",
+					Required: true,
+					Desc:     "用户的查询语句",
+				},
+			}),
+	}, func(ctx context.Context, input RagSearchByFileNameInput) (output RagSearchByFileNameOutput, err error) {
+		documents, err := re.Retrieve(ctx, input.Query, retriever2.WithFileName(input.FileName))
+		if err != nil {
+			return RagSearchByFileNameOutput{}, err
+		}
+		for _, document := range documents {
+			output.Content = append(output.Content, document.Content)
+			if document != nil {
+				output.MetaData = append(output.MetaData, document.MetaData)
+			}
+		}
+		return output, nil
+	})
 }

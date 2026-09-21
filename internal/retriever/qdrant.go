@@ -28,6 +28,7 @@ type QdrantRetriever struct {
 	collection string
 	topK       int
 	embedder   embedding.Embedder
+	filename   string
 }
 
 func NewQdrantRetriever(config Config) *QdrantRetriever {
@@ -42,6 +43,12 @@ func NewQdrantRetriever(config Config) *QdrantRetriever {
 func WithCollectionName(collection string) retriever.Option {
 	return retriever.WrapImplSpecificOptFn(func(t *QdrantRetriever) {
 		t.collection = collection
+	})
+}
+
+func WithFileName(filename string) retriever.Option {
+	return retriever.WrapImplSpecificOptFn(func(t *QdrantRetriever) {
+		t.filename = filename
 	})
 }
 
@@ -71,12 +78,20 @@ func (r *QdrantRetriever) Retrieve(ctx context.Context, query string, opts ...re
 	for i, v := range queryVector[0] {
 		vec32[i] = float32(v)
 	}
-	searchResult, err := local.client.Query(ctx, &qdrant.QueryPoints{
+	req := &qdrant.QueryPoints{
 		CollectionName: local.collection,
 		Query:          qdrant.NewQuery(vec32...),
 		Limit:          new(uint64(max(*options.TopK, 5))),
 		WithPayload:    qdrant.NewWithPayload(true),
-	})
+	}
+	if local.filename != "" {
+		req.Filter = &qdrant.Filter{
+			Must: []*qdrant.Condition{
+				qdrant.NewMatchKeyword("filename", local.filename),
+			},
+		}
+	}
+	searchResult, err := local.client.Query(ctx, req)
 	if err != nil {
 		return nil, err
 	}

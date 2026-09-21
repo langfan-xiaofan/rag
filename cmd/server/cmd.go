@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -28,7 +29,7 @@ import (
 
 const (
 	// 与 config/config.yaml 里配置的 embedding 模型维度保持一致
-	embedDimension = 2048
+	embedDimension = 1024
 	chunkSize      = 500
 	chunkOverlap   = 200
 )
@@ -40,6 +41,7 @@ func Cmd() {
 	if err := config.Init(); err != nil {
 		log.Fatal("加载 config.yaml 失败，请在项目根目录运行: ", err)
 	}
+	fmt.Printf("config：%+v\n", config.Conf)
 	r := gin.Default()
 	db, err := database.Init()
 	if err != nil {
@@ -93,6 +95,7 @@ func Cmd() {
 		Silo:          siloClient,
 		TextEmbedder:  Textembedder,
 		MultiEmbedder: multiModalembedder,
+		ChatModel:     chatmodel,
 	})
 	// 记忆管理模块
 	sessionManager := memory.NewSessionManager(db, 20)
