@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"rag/internal/model"
 	"slices"
+	"strings"
 
 	"github.com/cloudwego/eino/schema"
 	"gorm.io/gorm"
@@ -74,7 +75,30 @@ func (s *SessionManager) EnsureSession(ctx context.Context, userID uint, session
 			return fmt.Errorf("更新会话知识库失败: %w", err)
 		}
 	}
+
+	// 通过 POST /v1/session 新建的会话标题是“新对话”，首次提问时用问题更新
+	if session.Title == "" || session.Title == "新对话" {
+		if t := sessionTitle(title); t != "" {
+			if err := s.db.WithContext(ctx).Model(&model.Session{}).
+				Where("id = ? AND user_id = ?", sessionID, userID).
+				Update("title", t).Error; err != nil {
+				return fmt.Errorf("更新会话标题失败: %w", err)
+			}
+		}
+	}
 	return nil
+}
+
+func sessionTitle(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) > 30 {
+		return string(runes[:30]) + "…"
+	}
+	return text
 }
 
 // CreateSession implements [Session].

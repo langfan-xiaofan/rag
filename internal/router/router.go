@@ -27,6 +27,9 @@ func InitRouter(r *gin.Engine, db *gorm.DB, qdrantClient *qdrant.Client,
 	agentGroup := r.Group("/v1/agent", middleware.AuthMiddleware())
 	InitAgentRouter(agentGroup, Textembedder, qdrantClient, chatmodel, siloClient, sessionManager, kbSvc)
 
+	sessionGroup := r.Group("/v1/session", middleware.AuthMiddleware())
+	InitSessionRouter(sessionGroup, service.NewSessionService(db, sessionManager, kbSvc))
+
 	userGroup := r.Group("/v1/user")
 	InitUserRouter(userGroup, db)
 	return nil
