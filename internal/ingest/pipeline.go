@@ -10,7 +10,9 @@ import (
 	"io"
 	"mime/multipart"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"rag/internal/indexer"
 	"rag/internal/parser"
@@ -24,9 +26,11 @@ import (
 	"github.com/google/uuid"
 )
 
-// fileCollectionSuffix 是文件记录集合的后缀：
-// 文档分块进 {username}，文件记录进 {username}file。
-const fileCollectionSuffix = "file"
+// FileCleaner 在写入新版本前清理同一知识库里同名文件的旧分块和旧记录。
+// 由 service.KnowledgeBaseService 实现，避免 ingest 反向依赖知识库模型。
+type FileCleaner interface {
+	DeleteFileVectors(ctx context.Context, docCollection, fileCollection, fileName string) error
+}
 
 type Config struct {
 	// Parser 由 internal/parser.NewExtParser() 构造，类型是 eino 的 ExtParser
@@ -37,6 +41,7 @@ type Config struct {
 	TextEmbedder  embedding.Embedder
 	MultiEmbedder embedding.Embedder
 	ChatModel     *openai.ChatModel
+	Cleaner       FileCleaner
 }
 
 type Pipeline struct {
@@ -47,19 +52,40 @@ func New(cfg *Config) *Pipeline {
 	return &Pipeline{cfg: *cfg}
 }
 
-// Target 是每次调用携带的用户上下文：集合名与存储桶都用 Username。
+// Target 是每次调用携带的知识库上下文：集合名、对象存储前缀都由知识库记录决定。
 type Target struct {
-	Username string
-	Prefix   string
+	UserID          uint
+	Username        string
+	KnowledgeBaseID uint
+	DocCollection   string
+	FileCollection  string
+	ObjectPrefix    string
+	Prefix          string
+}
+
+// StoragePrefix 返回对象在桶里的最终前缀（知识库前缀 + 用户填写的归档目录）。
+func (t Target) StoragePrefix() string {
+	switch {
+	case t.ObjectPrefix == "":
+		return t.Prefix
+	case t.Prefix == "":
+		return t.ObjectPrefix
+	default:
+		return t.ObjectPrefix + "/" + t.Prefix
+	}
 }
 
 // IngestFile 走完整条流水线：
 //  1. 打开文件并嗅探 MIME 类型
-//  2. 上传对象存储（bucket = Username，key = Prefix/Filename）
-//  3. 写一条文件记录到 {Username}file
-//  4. 图片走多模态嵌入；其余走 解析 → 切分 → 逐块文本嵌入
-//  5. 存入 {Username}
+//  2. 上传对象存储（bucket = Username，key = ObjectPrefix/[Prefix/]Filename）
+//  3. 图片走多模态嵌入；其余走 解析 → 切分 → 逐块文本嵌入
+//  4. 清理同一知识库里同名文件的旧分块和旧记录
+//  5. 文档存入 DocCollection，文件记录存入 FileCollection
 func (p *Pipeline) IngestFile(ctx context.Context, f *multipart.FileHeader, t Target) error {
+	filename := silo.UploadFileName(f.Filename)
+	if filename == "" {
+		return fmt.Errorf("文件名不能为空")
+	}
 	src, err := f.Open()
 	if err != nil {
 		return fmt.Errorf("打开文件失败: %w", err)
@@ -70,72 +96,85 @@ func (p *Pipeline) IngestFile(ctx context.Context, f *multipart.FileHeader, t Ta
 	if err != nil {
 		return fmt.Errorf("文件类型解析失败: %w", err)
 	}
-	recordType := strings.ToLower(strings.TrimPrefix(filepath.Ext(f.Filename), "."))
+	recordType := strings.ToLower(strings.TrimPrefix(filepath.Ext(filename), "."))
 	if recordType == "" {
 		recordType = filetype
 	}
 
-	if err := p.cfg.Silo.UploadFile([]*multipart.FileHeader{f}, t.Username, t.Prefix); err != nil {
+	if err := p.cfg.Silo.UploadFile([]*multipart.FileHeader{f}, t.Username, t.StoragePrefix()); err != nil {
 		return fmt.Errorf("上传对象存储失败: %w", err)
 	}
 
-	var docs []*schema.Document
+	var (
+		docs    []*schema.Document
+		content string
+	)
 	if strings.HasPrefix(filetype, "image/") {
-		docs, err = p.imageDocs(ctx, f.Filename, src)
-	} else {
-		var builder strings.Builder
-		docs, err = p.textDocs(ctx, f, src)
+		docs, err = p.imageDocs(ctx, filename, src)
 		if err != nil {
 			return err
 		}
+	} else {
+		docs, err = p.textDocs(ctx, filename, src)
+		if err != nil {
+			return err
+		}
+		var builder strings.Builder
 		for _, doc := range docs {
 			builder.WriteString(doc.Content)
 		}
-		if err := p.storeFileRecord(ctx, f, t, builder.String(), recordType); err != nil {
-			return fmt.Errorf("写入文件记录失败: %w", err)
-		}
-	}
-	if err != nil {
-		return err
+		content = builder.String()
 	}
 
-	if _, err := p.cfg.Indexer.Store(ctx, docs, indexer.WithCollectionName(t.Username)); err != nil {
-		return fmt.Errorf("文件存入向量数据库失败: %w", err)
+	// 同名文件重新上传视为覆盖：先删旧分块和旧文件记录，再写新版本。
+	if p.cfg.Cleaner != nil {
+		if err := p.cfg.Cleaner.DeleteFileVectors(ctx, t.DocCollection, t.FileCollection, filename); err != nil {
+			return fmt.Errorf("清理同名旧文件失败: %w", err)
+		}
+	}
+
+	if len(docs) > 0 {
+		if _, err := p.cfg.Indexer.Store(ctx, docs, indexer.WithCollectionName(t.DocCollection)); err != nil {
+			return fmt.Errorf("文件存入向量数据库失败: %w", err)
+		}
+	}
+	if err := p.storeFileRecord(ctx, filename, t, content, recordType); err != nil {
+		return fmt.Errorf("写入文件记录失败: %w", err)
 	}
 	return nil
 }
 
 // storeFileRecord 把文件的元信息单独写一条记录，供 list_file 之类的工具按文件名找文件。
-func (p *Pipeline) storeFileRecord(ctx context.Context, f *multipart.FileHeader, t Target, content string, filetype string) error {
-	var result *schema.Message
-	var err error
+func (p *Pipeline) storeFileRecord(ctx context.Context, filename string, t Target, content, filetype string) error {
 	var summary string
 	if content != "" {
 		parserPrompt := `你是一个生成文件内容摘要的专家，请你根据用户上传文件的内容，生成一份具有内容细节的摘要。`
 		messages := []*schema.Message{schema.SystemMessage(parserPrompt), schema.UserMessage(content)}
-		result, err = p.cfg.ChatModel.Generate(ctx, messages)
+		result, err := p.cfg.ChatModel.Generate(ctx, messages)
 		if err != nil {
 			return err
 		}
 		summary = result.Content
 	}
-	vector, err := p.cfg.TextEmbedder.EmbedStrings(ctx, []string{fmt.Sprintf("文件名%s,摘要:%s", f.Filename, result)})
+	vector, err := p.cfg.TextEmbedder.EmbedStrings(ctx, []string{fmt.Sprintf("文件名%s,摘要:%s", filename, summary)})
 	if err != nil {
 		return err
 	}
 	doc := &schema.Document{
 		ID: uuid.New().String(),
 		MetaData: map[string]any{
-			"filename": f.Filename,
-			"key":      silo.ObjectKey(t.Prefix, f.Filename),
-			"filetype": filetype,
-			"bucket":   t.Username,
-			"vector":   toFloat32(vector[0]),
-			"summary":  summary,
+			"filename":    filename,
+			"key":         silo.ObjectKey(t.StoragePrefix(), filename),
+			"filetype":    filetype,
+			"bucket":      t.Username,
+			"kb_id":       strconv.FormatUint(uint64(t.KnowledgeBaseID), 10),
+			"summary":     summary,
+			"uploaded_at": time.Now().Format(time.RFC3339),
+			"vector":      toFloat32(vector[0]),
 		},
 	}
 	_, err = p.cfg.Indexer.Store(ctx, []*schema.Document{doc},
-		indexer.WithCollectionName(t.Username+fileCollectionSuffix))
+		indexer.WithCollectionName(t.FileCollection))
 	return err
 }
 
@@ -162,7 +201,7 @@ func (p *Pipeline) imageDocs(ctx context.Context, filename string, src io.Reader
 
 // textDocs 解析并按扩展名切分，再逐块做文本嵌入。
 // 每个分块都会带上 filename，供回答时标注来源。
-func (p *Pipeline) textDocs(ctx context.Context, f *multipart.FileHeader, src multipart.File) (docs []*schema.Document, err error) {
+func (p *Pipeline) textDocs(ctx context.Context, filename string, src multipart.File) (docs []*schema.Document, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			docs = nil
@@ -170,14 +209,14 @@ func (p *Pipeline) textDocs(ctx context.Context, f *multipart.FileHeader, src mu
 		}
 	}()
 	docs, err = p.cfg.Parser.Parse(ctx, src,
-		parser.WithFileName(f.Filename),
-		einoparser.WithURI(f.Filename),
+		parser.WithFileName(filename),
+		einoparser.WithURI(filename),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("文件解析失败: %w", err)
 	}
 
-	docs, err = p.cfg.Transformer.Transform(ctx, docs, transformer.WithExtName(filepath.Ext(f.Filename)))
+	docs, err = p.cfg.Transformer.Transform(ctx, docs, transformer.WithExtName(filepath.Ext(filename)))
 	if err != nil {
 		return nil, fmt.Errorf("文件转换失败: %w", err)
 	}
@@ -198,7 +237,7 @@ func (p *Pipeline) textDocs(ctx context.Context, f *multipart.FileHeader, src mu
 		if _, ok := docs[i].MetaData["content"]; !ok && doc.Content != "" {
 			docs[i].MetaData["content"] = doc.Content
 		}
-		docs[i].MetaData["filename"] = f.Filename
+		docs[i].MetaData["filename"] = filename
 		docs[i].MetaData["vector"] = toFloat32(vector[0])
 	}
 	return docs, nil

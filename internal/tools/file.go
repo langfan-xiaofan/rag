@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"errors"
+	"io"
 	"log"
 	"path"
 	"path/filepath"
@@ -17,9 +18,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
-
-// fileCollectionSuffix 与 ingest 的文件记录集合保持一致：记录进 {username}file。
-const fileCollectionSuffix = "file"
 
 type ListFileInput struct {
 	FileName string `json:"file_name"`
@@ -39,40 +37,61 @@ type ListFileOutput struct {
 	Files []FileInfo `json:"files"`
 }
 
-func NewListFileTool(ctx context.Context, username string, qdrantClient *qdrant.Client) tool.InvokableTool {
+func NewListFileTool(ctx context.Context, fileCollection string, qdrantClient *qdrant.Client) tool.InvokableTool {
 	return utils.NewTool(&schema.ToolInfo{
 		Name: "list_file",
-		Desc: ` • 什么时候用：用户问"我上传了哪些文件""有没有关于 X 的文件"                                                                                                                                          
-   • 返回什么：匹配到的文件名列表（不含文件内容）                                                                                                                                                       
-   • 之后做什么：用户要文件本体时再调 get_files `,
+		Desc: ` • 什么时候用：用户问"当前知识库里有哪些文件""有没有关于 X 的文件"
+   • 返回什么：当前知识库匹配到的文件名列表（不含文件内容）
+   • 之后做什么：用户要文件本体时再调 get_files`,
 		ParamsOneOf: schema.NewParamsOneOfByParams(
 			map[string]*schema.ParameterInfo{},
 		),
 	}, func(ctx context.Context, input struct{}) (output ListFileOutput, err error) {
 		output.Files = make([]FileInfo, 0)
-		pts, err := qdrantClient.Scroll(ctx, &qdrant.ScrollPoints{
-			CollectionName: username + fileCollectionSuffix,
-			WithPayload:    qdrant.NewWithPayload(true),
-			Limit:          new(uint32(200)),
-		})
+		exists, err := qdrantClient.CollectionExists(ctx, fileCollection)
 		if err != nil {
-			if status.Code(err) == codes.NotFound {
-				output.Note = "该账号还未上传任何文件"
-				err = nil
-				return
+			return output, err
+		}
+		if !exists {
+			output.Note = "该知识库还未上传任何文件"
+			return output, nil
+		}
+
+		it := qdrantClient.ScrollAll(ctx, &qdrant.ScrollPoints{
+			CollectionName: fileCollection,
+			WithPayload:    qdrant.NewWithPayload(true),
+			Limit:          new(uint32(256)),
+		})
+		for {
+			pts, err := it.Next()
+			if errors.Is(err, io.EOF) {
+				break
 			}
-			return
+			if err != nil {
+				if status.Code(err) == codes.NotFound {
+					output.Note = "该知识库还未上传任何文件"
+					return output, nil
+				}
+				return output, err
+			}
+			for _, pt := range pts {
+				payload := pt.GetPayload()
+				fileName := payload["filename"].GetStringValue()
+				fileType := payload["filetype"].GetStringValue()
+				if fileType == "" {
+					// 早期文件记录没有 filetype，按扩展名补一个展示值
+					fileType = strings.TrimPrefix(strings.ToLower(path.Ext(fileName)), ".")
+				}
+				output.Files = append(output.Files, FileInfo{
+					FileName: fileName,
+					FileType: fileType,
+					Bucket:   payload["bucket"].GetStringValue(),
+					Summary:  payload["summary"].GetStringValue(),
+					Key:      payload["key"].GetStringValue(),
+				})
+			}
 		}
-		for _, pt := range pts {
-			output.Files = append(output.Files, FileInfo{
-				FileName: pt.GetPayload()["filename"].GetStringValue(),
-				FileType: pt.GetPayload()["filetype"].GetStringValue(),
-				Bucket:   pt.GetPayload()["bucket"].GetStringValue(),
-				Summary:  pt.GetPayload()["summary"].GetStringValue(),
-				Key:      pt.GetPayload()["key"].GetStringValue(),
-			})
-		}
-		return
+		return output, nil
 	})
 }
 
@@ -123,7 +142,7 @@ type GetFileOutput struct {
 	Key string
 }
 
-func GetFileObjectTool(silo *silo.Silo, bucket, username string, qdrantClient *qdrant.Client) tool.InvokableTool {
+func GetFileObjectTool(silo *silo.Silo, bucket, fileCollection, objectPrefix, legacyPrefix string, qdrantClient *qdrant.Client) tool.InvokableTool {
 	return utils.NewTool(
 		&schema.ToolInfo{
 			Name: "get_files",
@@ -143,7 +162,7 @@ func GetFileObjectTool(silo *silo.Silo, bucket, username string, qdrantClient *q
 			if name == "" {
 				return output, errors.New("file_name 不能为空")
 			}
-			output.Key, err = resolveObjectKey(ctx, qdrantClient, username, name, silo, bucket)
+			output.Key, err = resolveObjectKey(ctx, qdrantClient, fileCollection, objectPrefix, legacyPrefix, name, silo, bucket)
 			if err != nil {
 				return output, err
 			}
@@ -156,22 +175,42 @@ func GetFileObjectTool(silo *silo.Silo, bucket, username string, qdrantClient *q
 	)
 }
 
-// resolveObjectKey 定位文件在桶里真实存在的 key：先看文件记录里存的 key，
-// 再退回裸文件名，最后按文件名在桶里兜底扫。早期版本把对象存成「前缀/文件名」，
-// 却只按文件名签链接，于是点开就是 NoSuchKey。
-func resolveObjectKey(ctx context.Context, qdrantClient *qdrant.Client, username, name string, silo *silo.Silo, bucket string) (string, error) {
-	candidates := make([]string, 0, 3)
-	if key := recordObjectKey(ctx, qdrantClient, username, name); key != "" {
+// resolveObjectKey 只允许定位当前知识库里的对象：
+//   - 先看文件记录里存的 key；
+//   - 再试知识库前缀下的同名文件；
+//   - 默认知识库额外允许旧前缀（username/）和桶根目录；
+//   - 最后对默认知识库做一次排除 kb_ 前缀的旧目录兜底，避免命中其他知识库。
+func resolveObjectKey(ctx context.Context, qdrantClient *qdrant.Client, fileCollection, objectPrefix, legacyPrefix, name string, silo *silo.Silo, bucket string) (string, error) {
+	candidates := make([]string, 0, 5)
+	if key := recordObjectKey(ctx, qdrantClient, fileCollection, name); key != "" {
 		candidates = append(candidates, key)
 	}
-	return silo.ResolveKey(bucket, name, append(candidates, name, path.Base(name))...)
+	base := path.Base(strings.ReplaceAll(name, "\\", "/"))
+	if objectPrefix != "" {
+		candidates = append(candidates, path.Join(objectPrefix, base))
+	}
+	if legacyPrefix != "" {
+		candidates = append(candidates, path.Join(legacyPrefix, base), base)
+	}
+	key, err := silo.ResolveKeyWithin(bucket, candidates...)
+	if err == nil {
+		return key, nil
+	}
+	if legacyPrefix != "" {
+		return silo.ResolveLegacyKey(bucket, base)
+	}
+	return "", err
 }
 
 // recordObjectKey 取出这条文件记录里存的 key。
 // 记录不存在（图片不写记录、老数据、记录被删）时返回空串，交给调用方兜底。
-func recordObjectKey(ctx context.Context, qdrantClient *qdrant.Client, username, name string) string {
+func recordObjectKey(ctx context.Context, qdrantClient *qdrant.Client, fileCollection, name string) string {
+	exists, err := qdrantClient.CollectionExists(ctx, fileCollection)
+	if err != nil || !exists {
+		return ""
+	}
 	pts, err := qdrantClient.Scroll(ctx, &qdrant.ScrollPoints{
-		CollectionName: username + fileCollectionSuffix,
+		CollectionName: fileCollection,
 		Filter: &qdrant.Filter{
 			Should: []*qdrant.Condition{
 				qdrant.NewMatch("filename", name),

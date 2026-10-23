@@ -15,6 +15,7 @@ import (
 	"rag/internal/ingest"
 	"rag/internal/parser"
 	"rag/internal/router"
+	"rag/internal/service"
 	"rag/internal/silo"
 	"rag/internal/transformer"
 
@@ -62,6 +63,10 @@ func Cmd() {
 	if err != nil {
 		panic(err)
 	}
+	// 升级前的数据是“用户名即集合名”，迁到一个默认知识库下，避免旧文件失去入口。
+	if err := database.MigrateLegacyKnowledgeBases(db, qdrantclient); err != nil {
+		log.Fatal("迁移旧知识库数据失败: ", err)
+	}
 	//文本嵌入工具
 	Textembedder, err := embedder.NewTextEmbedder(context.Background())
 	if err != nil {
@@ -84,6 +89,7 @@ func Cmd() {
 	}
 	// 解析器、切分器、索引器都是无状态的，构造一次交给流水线复用
 	siloClient := silo.NewSilo(silo.ConfigSilo{S3Client: s3Client})
+	kbService := service.NewKnowledgeBaseService(db, qdrantclient, siloClient)
 	extParser, err := parser.NewExtParser()
 	if err != nil {
 		log.Fatal("初始化解析器失败: ", err)
@@ -96,10 +102,11 @@ func Cmd() {
 		TextEmbedder:  Textembedder,
 		MultiEmbedder: multiModalembedder,
 		ChatModel:     chatmodel,
+		Cleaner:       kbService,
 	})
-	// 记忆管理模块
-	sessionManager := memory.NewSessionManager(db, 20)
-	router.InitRouter(r, db, qdrantclient, siloClient, pipeline, sessionManager, Textembedder, chatmodel)
+	// 记忆管理模块：上下文窗口 20 条，攒够 10 条掉出窗口的消息就压进滚动摘要
+	sessionManager := memory.NewSessionManager(db, 20, 10)
+	router.InitRouter(r, db, qdrantclient, siloClient, pipeline, sessionManager, Textembedder, chatmodel, kbService)
 	srv := http.Server{
 		Addr:    ":8080",
 		Handler: r,

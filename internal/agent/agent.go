@@ -46,18 +46,22 @@ func (h *Handler) AfterModelRewriteState(ctx context.Context, state *adk.ChatMod
 	return ctx, state, nil
 }
 
-func NewAgent(ragRetriever, fileRetriever retriever.Retriever, silo *silo.Silo, bucket string,
-	onMessage func(ctx context.Context, message *schema.Message), username string, qdrantClient *qdrant.Client) adk.ResumableAgent {
-	chatmodel, err := openai.NewChatModel(context.Background(), &openai.ChatModelConfig{
-		BaseURL: os.Getenv("DEEPSEEK_BASE_URL"),
-		APIKey:  os.Getenv("DEEPSEEK_API_KEY"),
-		Model:   os.Getenv("DEEPSEEK_MODEL_NAME"),
-	})
-	if err != nil {
-		panic(err)
+func NewAgent(ragRetriever retriever.Retriever, siloClient *silo.Silo, bucket, fileCollection, objectPrefix, legacyPrefix string,
+	onMessage func(ctx context.Context, message *schema.Message), qdrantClient *qdrant.Client,
+	chatModel *openai.ChatModel) adk.ResumableAgent {
+	if chatModel == nil {
+		var err error
+		chatModel, err = openai.NewChatModel(context.Background(), &openai.ChatModelConfig{
+			BaseURL: os.Getenv("DEEPSEEK_BASE_URL"),
+			APIKey:  os.Getenv("DEEPSEEK_API_KEY"),
+			Model:   os.Getenv("DEEPSEEK_MODEL_NAME"),
+		})
+		if err != nil {
+			panic(err)
+		}
 	}
 	agent, _ := adk.NewTypedChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
-		Model:       chatmodel,
+		Model:       chatModel,
 		Name:        "agent",
 		Description: "你是一个全能的agent",
 		ToolsConfig: adk.ToolsConfig{
@@ -65,9 +69,8 @@ func NewAgent(ragRetriever, fileRetriever retriever.Retriever, silo *silo.Silo, 
 			ToolsNodeConfig: compose.ToolsNodeConfig{
 				Tools: []tool.BaseTool{
 					tools.NewRagTool(ragRetriever),
-					tools.GetFileObjectTool(silo, bucket, username, qdrantClient),
-					//tools.NewGetFilesNameTool(fileRetriever),
-					tools.NewListFileTool(context.Background(), username, qdrantClient),
+					tools.GetFileObjectTool(siloClient, bucket, fileCollection, objectPrefix, legacyPrefix, qdrantClient),
+					tools.NewListFileTool(context.Background(), fileCollection, qdrantClient),
 					tools.RagSearchByFileName(ragRetriever),
 				},
 				ToolCallMiddlewares: []compose.ToolMiddleware{
@@ -76,7 +79,13 @@ func NewAgent(ragRetriever, fileRetriever retriever.Retriever, silo *silo.Silo, 
 							return func(ctx context.Context, input *compose.ToolInput) (*compose.ToolOutput, error) {
 								output, err := toolEndpoint(ctx, input)
 								if err != nil {
-									return nil, err
+									// 工具失败也必须补一条 tool 消息，否则助手那条带 tool_calls 的消息会成为孤儿，
+									// 之后每一轮请求都会被模型 API 以「tool_calls 没有对应的 tool 消息」拒绝。
+									// 注意：失败时 output 恒为 nil（eino compose/tool_node.go 的 wrapToolCall 直接
+									// return nil, err），所以只能拿 err 当工具结果，不能碰 output。
+									onMessage(ctx, schema.ToolMessage("工具调用失败："+err.Error(), input.CallID, schema.WithToolName(input.Name)))
+									log.Printf("调用工具 %s 失败: %v\n", input.Name, err)
+									return &compose.ToolOutput{Result: "工具调用失败:" + err.Error()}, nil
 								}
 								onMessage(ctx, schema.ToolMessage(output.Result, input.CallID, schema.WithToolName(input.Name))) //利用闭包函数存储工具类型的消息。
 								log.Printf("调用工具 %s: %v\n", input.Name, input.Arguments)

@@ -2,6 +2,7 @@ package silo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"mime"
 	"mime/multipart"
@@ -67,7 +68,7 @@ func (s *Silo) UploadFile(files []*multipart.FileHeader, bucketName string, pref
 				filetype = t
 			}
 		}
-		key := ObjectKey(prefix, file.Filename)
+		key := ObjectKey(prefix, UploadFileName(file.Filename))
 		_, err = s.s3Client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:        aws.String(bucketName),
 			Body:          fileStream,
@@ -153,6 +154,57 @@ func (s *Silo) ResolveKey(bucketName string, fileName string, candidates ...stri
 	return best, nil
 }
 
+// ResolveKeyWithin 只在给定的候选 key 中查找，不做整桶扫描。
+// 用于把下载范围限制在当前知识库前缀内，避免命中其他知识库的同名文件。
+func (s *Silo) ResolveKeyWithin(bucketName string, candidates ...string) (string, error) {
+	keys := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || slices.Contains(keys, candidate) {
+			continue
+		}
+		keys = append(keys, candidate)
+	}
+	for _, key := range keys {
+		exist, err := s.objectExists(context.Background(), bucketName, key)
+		if err != nil {
+			return "", err
+		}
+		if exist {
+			return key, nil
+		}
+	}
+	return "", fmt.Errorf("对象存储桶 %s 里找不到当前知识库的文件（已尝试 key：%s）",
+		bucketName, strings.Join(keys, "、"))
+}
+
+// ResolveLegacyKey 在桶里按文件名找迁移前的旧对象，但跳过所有 kb_ 前缀。
+// 只给默认知识库里没有记录 key 的老文件兜底，避免命中新知识库的对象。
+func (s *Silo) ResolveLegacyKey(bucketName, fileName string) (string, error) {
+	keys, err := s.listObjectKeys(context.Background(), bucketName)
+	if err != nil {
+		return "", err
+	}
+	base := path.Base(strings.ReplaceAll(fileName, "\\", "/"))
+	best := ""
+	for _, key := range keys {
+		if strings.HasPrefix(key, "kb_") {
+			continue
+		}
+		if path.Base(key) != base {
+			continue
+		}
+		// 同一个文件名可能在多个旧目录下，取最浅的那个
+		if best == "" || len(key) < len(best) || (len(key) == len(best) && key < best) {
+			best = key
+		}
+	}
+	if best == "" {
+		return "", fmt.Errorf("对象存储桶 %s 里找不到旧文件 %s", bucketName, fileName)
+	}
+	return best, nil
+}
+
 // objectExists 用「前缀列举 + 精确比对」判断 key 是否存在。
 // 不用 HeadObject 是因为各家 S3 兼容实现回 404 的错误码并不统一。
 func (s *Silo) objectExists(ctx context.Context, bucketName string, key string) (bool, error) {
@@ -172,23 +224,114 @@ func (s *Silo) objectExists(ctx context.Context, bucketName string, key string) 
 	return false, nil
 }
 
+// DeleteObject 删除单个对象。对象不存在视为成功，方便重复清理。
+func (s *Silo) DeleteObject(bucketName, key string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil
+	}
+	_, err := s.s3Client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(key),
+	})
+	if err != nil && !isObjectNotFound(err) && !isInvalidBucketName(err) {
+		return err
+	}
+	return nil
+}
+
+// DeletePrefix 删除某个前缀下的所有对象。拒绝空前缀，避免误删整个桶。
+func (s *Silo) DeletePrefix(bucketName, prefix string) error {
+	prefix = strings.Trim(strings.TrimSpace(prefix), "/")
+	if prefix == "" {
+		return errors.New("拒绝删除空前缀")
+	}
+	keys, err := s.listObjectKeysWithPrefix(context.Background(), bucketName, prefix, 100000)
+	if err != nil {
+		if isObjectNotFound(err) || isInvalidBucketName(err) {
+			return nil
+		}
+		return err
+	}
+	return s.deleteKeys(bucketName, keys)
+}
+
+func (s *Silo) deleteKeys(bucketName string, keys []string) error {
+	const batchSize = 1000
+	for start := 0; start < len(keys); start += batchSize {
+		end := start + batchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		objects := make([]types.ObjectIdentifier, 0, end-start)
+		for _, key := range keys[start:end] {
+			objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
+		}
+		_, err := s.s3Client.DeleteObjects(context.Background(), &s3.DeleteObjectsInput{
+			Bucket: aws.String(bucketName),
+			Delete: &types.Delete{
+				Objects: objects,
+				Quiet:   aws.Bool(true),
+			},
+		})
+		if err != nil && !isObjectNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func isObjectNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var noKey *types.NoSuchKey
+	if errors.As(err, &noKey) {
+		return true
+	}
+	var noBucket *types.NoSuchBucket
+	if errors.As(err, &noBucket) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "NoSuchKey") || strings.Contains(msg, "NoSuchBucket")
+}
+
+// isInvalidBucketName 表示用户名本身不是合法的 S3 桶名（例如带下划线）。
+// 这种桶不可能存有对象，删除时按“无对象”处理，避免知识库删不掉。
+func isInvalidBucketName(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "InvalidBucketName")
+}
+
+// UploadFileName 只保留文件名本身，避免客户端把路径写进对象 key。
+func UploadFileName(name string) string {
+	return path.Base(strings.ReplaceAll(strings.TrimSpace(name), "\\", "/"))
+}
+
 // listObjectKeys 分页列出桶里的 key，供按文件名兜底查找。
 func (s *Silo) listObjectKeys(ctx context.Context, bucketName string) ([]string, error) {
 	// 兜底查找只服务小桶，避免桶异常大时把整桶读进内存。
-	const maxKeys = 10000
+	return s.listObjectKeysWithPrefix(ctx, bucketName, "", 10000)
+}
+
+func (s *Silo) listObjectKeysWithPrefix(ctx context.Context, bucketName, prefix string, maxKeys int) ([]string, error) {
 	keys := make([]string, 0, 64)
 	var token *string
 	for {
-		out, err := s.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		input := &s3.ListObjectsV2Input{
 			Bucket:            aws.String(bucketName),
 			ContinuationToken: token,
-		})
+		}
+		if prefix != "" {
+			input.Prefix = aws.String(prefix)
+		}
+		out, err := s.s3Client.ListObjectsV2(ctx, input)
 		if err != nil {
 			return nil, err
 		}
 		for _, obj := range out.Contents {
 			keys = append(keys, aws.ToString(obj.Key))
-			if len(keys) >= maxKeys {
+			if maxKeys > 0 && len(keys) >= maxKeys {
 				return keys, nil
 			}
 		}

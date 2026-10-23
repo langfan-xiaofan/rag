@@ -62,6 +62,14 @@ func (r *QdrantRetriever) Retrieve(ctx context.Context, query string, opts ...re
 	if local.embedder == nil {
 		return nil, errors.New("embedder is nil")
 	}
+	exists, err := local.client.CollectionExists(ctx, local.collection)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		// 空知识库还没有创建集合，按“没有检索结果”处理
+		return []*schema.Document{}, nil
+	}
 	queryVector, err := local.embedder.EmbedStrings(ctx, []string{query})
 	if err != nil {
 		return nil, err

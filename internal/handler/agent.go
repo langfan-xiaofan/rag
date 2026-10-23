@@ -2,7 +2,6 @@ package handler
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 	"rag/internal/dto"
 	"rag/internal/memory"
@@ -19,32 +18,38 @@ type AgentHnadler struct {
 	svc *service.AgentService
 }
 
-func NewAgentHandler(qdrant *qdrant.Client, embedder embedding.Embedder, chatmodel *openai.ChatModel, siloClient *silo.Silo, sessionManager *memory.SessionManager) *AgentHnadler {
+func NewAgentHandler(qdrant *qdrant.Client, embedder embedding.Embedder, chatmodel *openai.ChatModel,
+	siloClient *silo.Silo, sessionManager *memory.SessionManager, kbSvc *service.KnowledgeBaseService) *AgentHnadler {
 	return &AgentHnadler{
-		service.NewAgentService(qdrant, embedder, chatmodel, siloClient, sessionManager),
+		service.NewAgentService(qdrant, embedder, chatmodel, siloClient, sessionManager, kbSvc),
 	}
 }
 
 func (h *AgentHnadler) Ask(c *gin.Context) {
 	var req dto.AskReq
 	username := c.GetString("username")
-	userid := c.GetUint("user_id")
-	fmt.Println("username:", username)
+	userID := c.GetUint("user_id")
 	if err := c.ShouldBindBodyWithJSON(&req); err != nil {
-		c.JSON(500, map[string]any{
-			"msg":  "参数错误" + err.Error(),
+		c.JSON(http.StatusBadRequest, map[string]any{
+			"msg":  "参数错误: " + err.Error(),
 			"data": nil,
 		})
 		return
 	}
-	sessionID, ch, err := h.svc.Ask(c.Request.Context(), req.Query, username, 10, userid, req.SessionID, 20)
+	sessionID, ch, err := h.svc.Ask(c.Request.Context(), req.Query, req.KnowledgeBaseID,
+		username, 10, userID, req.SessionID, 20)
 	if err != nil {
 		status := http.StatusInternalServerError
-		if errors.Is(err, memory.ErrSessionDeleted) {
+		switch {
+		case errors.Is(err, memory.ErrSessionDeleted):
 			status = http.StatusBadRequest
+		case errors.Is(err, memory.ErrSessionKBConflict):
+			status = http.StatusConflict
+		case errors.Is(err, service.ErrKnowledgeBaseNotFound):
+			status = http.StatusNotFound
 		}
 		c.JSON(status, map[string]any{
-			"msg":  "生成回答错误" + err.Error(),
+			"msg":  "生成回答错误: " + err.Error(),
 			"data": nil,
 		})
 		return

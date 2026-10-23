@@ -3,6 +3,7 @@ package router
 import (
 	"rag/internal/handler"
 	"rag/internal/memory"
+	"rag/internal/service"
 	"rag/internal/silo"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
@@ -11,7 +12,9 @@ import (
 	"github.com/qdrant/go-client/qdrant"
 )
 
-func InitAgentRouter(r *gin.RouterGroup, embedder embedding.Embedder, qdrant *qdrant.Client, chatmodel *openai.ChatModel, siloClient *silo.Silo, sessionManager *memory.SessionManager) {
-	AgentHandler := handler.NewAgentHandler(qdrant, embedder, chatmodel, siloClient, sessionManager)
-	r.POST("/ask", AgentHandler.Ask)
+func InitAgentRouter(r *gin.RouterGroup, embedder embedding.Embedder, qdrant *qdrant.Client,
+	chatmodel *openai.ChatModel, siloClient *silo.Silo, sessionManager *memory.SessionManager,
+	kbSvc *service.KnowledgeBaseService) {
+	agentHandler := handler.NewAgentHandler(qdrant, embedder, chatmodel, siloClient, sessionManager, kbSvc)
+	r.POST("/ask", agentHandler.Ask)
 }
